@@ -7,7 +7,9 @@ git pull
 git submodule update --init --recursive
 
 # 2. Run the patch script (from the firmware root)
+# pressure at sea level is approx 1013.25 use the pressure at your altitude. https://www.mide.com/air-pressure-at-altitude-calculator
 python patch_ms5837.py --surface-pressure 1025.0
+
 
 # 3. Build
 pio run -e nrf52_promicro_diy_tcxo
