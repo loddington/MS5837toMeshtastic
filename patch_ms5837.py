@@ -42,7 +42,6 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from textwrap import dedent
 
 
 # ---------------------------------------------------------------------------
@@ -53,27 +52,31 @@ class PatchError(Exception):
     pass
 
 
-def read_file(path: Path) -> str:
+def read_file(path: Path) -> tuple:
+    """Read file, returning (content_with_lf, original_had_crlf)."""
     try:
-        return path.read_text(encoding="utf-8")
+        raw = path.read_bytes()
     except FileNotFoundError:
         raise PatchError(f"File not found: {path}\n"
                          "Make sure --firmware-dir points to the root of the "
                          "meshtastic/firmware repository.")
+    had_crlf = b"\r\n" in raw
+    content = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    return content, had_crlf
 
 
-def write_file(path: Path, content: str, dry_run: bool):
+def write_file(path: Path, content: str, dry_run: bool, crlf: bool = False):
     if dry_run:
         print(f"  [DRY RUN] Would write {path}")
     else:
-        path.write_text(content, encoding="utf-8")
+        if crlf:
+            content = content.replace("\n", "\r\n")
+        path.write_bytes(content.encode("utf-8"))
         print(f"  Written:  {path}")
 
 
 def apply_replacement(content: str, old: str, new: str, description: str) -> str:
     """Replace old with new exactly once; raise PatchError if not found."""
-    old = dedent(old).strip()
-    new = dedent(new).strip()
     if old not in content:
         raise PatchError(
             f"Could not find anchor text for: {description}\n"
@@ -285,26 +288,18 @@ PATCH_MARKER = "// MS5837_PATCH_APPLIED"
 
 
 def patch_scan_i2c_h(content: str) -> str:
-    """Add MS5837 to the DeviceType enum."""
+    """Add MS5837 to the DeviceType enum, after the last existing entry (ADS1115)."""
     return apply_replacement(
         content,
-        old="BMP280,\n        BME280,",
-        new="BMP280,\n        BME280,\n        MS5837,",
+        old="    ADS1115,\n    } DeviceType;",
+        new="    ADS1115,\n    MS5837,\n    } DeviceType;",
         description="ScanI2C.h DeviceType enum"
     )
 
 
 def patch_scan_i2c_two_wire_cpp(content: str) -> str:
     """Add MS5837 detection inside the case 0x00 branch of the BME_ADDR block."""
-    old = """\
-                    if (type == DPS310) {
-                        break;
-                    }
-                default:"""
-    new = """\
-                    if (type == DPS310) {
-                        break;
-                    }
+    ms5837_block = """\
                     // Check for MS5837: send RESET command (0x1E) - only MS5837 will ACK
                     // this at address 0x76 when the Bosch chip-ID register returned 0x00.
                     if (addr.address == 0x76) {
@@ -325,10 +320,69 @@ def patch_scan_i2c_two_wire_cpp(content: str) -> str:
                     }
                     if (type == MS5837) {
                         break;
-                    }
-                default:"""
-    return apply_replacement(content, old, new, "ScanI2CTwoWire.cpp MS5837 detection")
+                    }\n"""
 
+    # Try several possible anchor variants across firmware versions
+    anchors = [
+        # variant A - seen in working build
+        "                    if (type == DPS310) {\n"
+        "                        break;\n"
+        "                    }\n"
+        "                default:",
+        # variant B - tighter spacing
+        "                    if (type == DPS310) {\n"
+        "                        break;\n"
+        "                    }\n"
+        "                    default:",
+    ]
+    for old in anchors:
+        if old in content:
+            new = old.replace(
+                "                    if (type == DPS310) {\n"
+                "                        break;\n"
+                "                    }\n",
+                "                    if (type == DPS310) {\n"
+                "                        break;\n"
+                "                    }\n" + ms5837_block
+            )
+            return content.replace(old, new, 1)
+
+    raise PatchError(
+        "Could not find anchor text for: ScanI2CTwoWire.cpp MS5837 detection\n"
+        "The firmware source may have changed since this patch was written.\n"
+        "Find the 'case 0x00:' branch inside the BME_ADDR address block and add\n"
+        "the MS5837 RESET detection block after the DPS310 check. See README.md."
+    )
+
+
+def patch_platformio_ini(content: str) -> str:
+    """Add BlueRobotics MS5837 library to the environmental_base section."""
+    if "BlueRobotics_MS5837" in content:
+        return content  # already present
+
+    # The lib uses a zip URL like all other entries. Insert after the BME280 zip line
+    # which is in [environmental_base] and uses tab indentation.
+    anchor = "Adafruit_BME280_Library/archive/refs/tags/2.3.0.zip"
+    if anchor in content:
+        idx = content.find(anchor) + len(anchor)
+        insertion = (
+            "\n\t# MS5837-30BA underwater pressure sensor for water tank level monitoring"
+            "\n\thttps://github.com/bluerobotics/BlueRobotics_MS5837_Library/"
+            "archive/refs/tags/1.1.1.zip"
+        )
+        return content[:idx] + insertion + content[idx:]
+
+    # Fallback: try any BME280 zip line (version may have changed)
+    import re
+    m = re.search(r'Adafruit_BME280_Library/archive/refs/tags/[\d.]+\.zip', content)
+    if m:
+        idx = m.end()
+        insertion = (
+            "\n\t# MS5837-30BA underwater pressure sensor for water tank level monitoring"
+            "\n\thttps://github.com/bluerobotics/BlueRobotics_MS5837_Library/"
+            "archive/refs/tags/1.1.1.zip"
+        )
+        return content[:idx] + insertion + content[idx:]
 
 def patch_environment_telemetry_cpp(content: str) -> str:
     """Add MS5837 include and addSensor call."""
@@ -359,7 +413,6 @@ def patch_environment_telemetry_cpp(content: str) -> str:
 
 
 def patch_platformio_ini(content: str) -> str:
-    """Add BlueRobotics MS5837 library dependency."""
     # Find the lib_deps line and append after the last entry before the next blank/section
     if "bluerobotics/BlueRobotics_MS5837_Library" in content:
         return content  # already present
@@ -449,7 +502,7 @@ def main():
             (paths["sensor_cpp"],            "bool MS5837Sensor::initDevice",  "MS5837Sensor.cpp"),
         ]
         for path, marker, label in checks:
-            if path.exists() and marker in read_file(path):
+            if path.exists() and marker in read_file(path)[0]:
                 print(f"  [OK]     {label}")
             else:
                 print(f"  [MISSING] {label}  ({path.name})")
@@ -487,12 +540,12 @@ def main():
     # ------------------------------------------------------------------
     print("\nStep 2: Patch src/detect/ScanI2C.h")
     try:
-        content = read_file(paths["scan_i2c_h"])
+        content, crlf = read_file(paths["scan_i2c_h"])
         if already_patched(content, "MS5837,"):
             print("  Already patched, skipping.")
         else:
             content = patch_scan_i2c_h(content)
-            write_file(paths["scan_i2c_h"], content, args.dry_run)
+            write_file(paths["scan_i2c_h"], content, args.dry_run, crlf)
     except PatchError as e:
         print(f"  WARNING: {e}")
         errors.append("ScanI2C.h")
@@ -502,12 +555,12 @@ def main():
     # ------------------------------------------------------------------
     print("\nStep 3: Patch src/detect/ScanI2CTwoWire.cpp")
     try:
-        content = read_file(paths["scan_i2c_twowire_cpp"])
+        content, crlf = read_file(paths["scan_i2c_twowire_cpp"])
         if already_patched(content, "MS5837 RESET command"):
             print("  Already patched, skipping.")
         else:
             content = patch_scan_i2c_two_wire_cpp(content)
-            write_file(paths["scan_i2c_twowire_cpp"], content, args.dry_run)
+            write_file(paths["scan_i2c_twowire_cpp"], content, args.dry_run, crlf)
     except PatchError as e:
         print(f"  WARNING: {e}")
         errors.append("ScanI2CTwoWire.cpp")
@@ -517,12 +570,12 @@ def main():
     # ------------------------------------------------------------------
     print("\nStep 4: Patch src/modules/Telemetry/EnvironmentTelemetry.cpp")
     try:
-        content = read_file(paths["environment_cpp"])
+        content, crlf = read_file(paths["environment_cpp"])
         if already_patched(content, "addSensor<MS5837Sensor>"):
             print("  Already patched, skipping.")
         else:
             content = patch_environment_telemetry_cpp(content)
-            write_file(paths["environment_cpp"], content, args.dry_run)
+            write_file(paths["environment_cpp"], content, args.dry_run, crlf)
     except PatchError as e:
         print(f"  WARNING: {e}")
         errors.append("EnvironmentTelemetry.cpp")
@@ -532,12 +585,12 @@ def main():
     # ------------------------------------------------------------------
     print("\nStep 5: Patch platformio.ini")
     try:
-        content = read_file(paths["platformio_ini"])
+        content, crlf = read_file(paths["platformio_ini"])
         if already_patched(content, "BlueRobotics_MS5837_Library"):
             print("  Already patched, skipping.")
         else:
             content = patch_platformio_ini(content)
-            write_file(paths["platformio_ini"], content, args.dry_run)
+            write_file(paths["platformio_ini"], content, args.dry_run, crlf)
     except PatchError as e:
         print(f"  WARNING: {e}")
         errors.append("platformio.ini")
