@@ -384,6 +384,16 @@ def patch_platformio_ini(content: str) -> str:
         )
         return content[:idx] + insertion + content[idx:]
 
+    raise PatchError(
+        "Could not find anchor text for: platformio.ini BlueRobotics MS5837 library\n"
+        "The firmware source may have changed since this patch was written.\n"
+        "Manually add the following line to the [environmental_base] lib_deps section\n"
+        "after the Adafruit BME280 Library entry:\n\n"
+        "\thttps://github.com/bluerobotics/BlueRobotics_MS5837_Library/"
+        "archive/refs/tags/1.1.1.zip"
+    )
+
+
 def patch_environment_telemetry_cpp(content: str) -> str:
     """Add MS5837 include and addSensor call."""
     # Include
@@ -410,20 +420,6 @@ def patch_environment_telemetry_cpp(content: str) -> str:
         description="EnvironmentTelemetry.cpp addSensor call"
     )
     return content
-
-
-def patch_platformio_ini(content: str) -> str:
-    # Find the lib_deps line and append after the last entry before the next blank/section
-    if "bluerobotics/BlueRobotics_MS5837_Library" in content:
-        return content  # already present
-    # Insert after adafruit/Adafruit BME280 Library which is reliably present
-    return apply_replacement(
-        content,
-        old="adafruit/Adafruit BME280 Library",
-        new="adafruit/Adafruit BME280 Library\n"
-            "    bluerobotics/BlueRobotics_MS5837_Library @ ^1.1.1",
-        description="platformio.ini BlueRobotics MS5837 library"
-    )
 
 
 # ---------------------------------------------------------------------------
