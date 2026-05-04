@@ -2,7 +2,8 @@
 Add the MS5837 sensor (GW-MS5837-30BA) to meshtastic for water level measurement.  
 
 # 1. Pull the new firmware
-cd meshtastic/firmware
+# git clone https://github.com/meshtastic/firmware.git
+cd /firmware
 git pull
 git submodule update --init --recursive
 
